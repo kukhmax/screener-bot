@@ -1,63 +1,90 @@
 import asyncio
-import ccxt.pro as ccxtpro # Используем ccxt.pro для WebSocket
+import ccxt
+import ccxt.pro as ccxtpro
 import time
-# from aiogram import Bot # Пока не используем Telegram
+from collections import deque
+# УДАЛЕНО: import numpy as np
 
-# --- НАСТРОЙКИ ---
-# BOT_TOKEN = '7565486640:AAG8yM1cB0dAJOpxF26-vrP4DTVe8MI_Z-M' # Пример
-# CHAT_ID = '199222002' # ВАШ ЛИЧНЫЙ ID, ПОЛУЧЕННЫЙ ОТ @userinfobot
-MEXC_WSS_URL = "wss://wbs.mexc.com/ws" # Адрес WebSocket MEXC V3
-TEST_SYMBOL = "BTCUSDT" # Тестовая пара (без '/')
-# -----------------
+# Импортируем нашу функцию детектора
+from detectors.brush_detector import check_brush_pattern
 
+# --- НАСТРОЙКИ БИРЖИ ---
+TEST_SYMBOL = '42069COIN/USDT'
+# ----------------------
+
+# --- НАСТРОЙКИ ДЕТЕКТОРА (берем из модуля, но можем переопределить) ---
+# Например, максимальная длина deque должна соответствовать lookback из детектора
+# Импортируем настройки из модуля детектора, чтобы использовать их
+from detectors.brush_detector import BRUSH_LOOKBACK_TRADES
+
+# Хранилище последних цен
+price_history = deque(maxlen=BRUSH_LOOKBACK_TRADES)
 
 async def watch_mexc_deals():
-    """Подключается к MEXC через ccxt.pro и получает поток сделок."""
-    exchange = ccxtpro.mexc({
-        'options': {
-            'defaultType': 'spot', # Указываем, что работаем со спотом
-            # 'watchTrades': {'name': 'spot@public.deals.v3.api'}, # Можно кастомизировать имя потока если нужно
-        },
-        # 'verbose': True # Раскомментируйте для детального логгирования от ccxt
-    })
+    """Подключается к MEXC, получает сделки и вызывает детектор 'Ёршика'."""
+    exchange = ccxtpro.mexc({'options': {'defaultType': 'spot'}})
     print(f"Подключаемся к MEXC для отслеживания сделок по {TEST_SYMBOL}...")
+
+    last_pattern_print_time = 0
+    cooldown_period = 60 # Период "остывания" в секундах
 
     while True:
         try:
-            # Используем watch_trades для получения потока сделок
             trades = await exchange.watch_trades(TEST_SYMBOL)
             if trades:
-                # trades - это список сделок, полученных с момента последнего вызова
-                # Выводим только последнюю сделку из пачки для краткости
-                latest_trade = trades[-1]
-                print(f"[{latest_trade['datetime']}] {latest_trade['symbol']} | "
-                      f"Цена: {latest_trade['price']} | Кол-во: {latest_trade['amount']} | "
-                      f"Сторона: {latest_trade['side']}")
-                # print(f"Получены сделки: {trades}") # Раскомментируйте, чтобы видеть всю пачку
+                new_pattern_found_in_batch = False
+                details_for_batch = {}
 
-        except ccxtpro.NetworkError as e:
+                for trade in trades:
+                    try:
+                        price = float(trade['price']) # Получаем цену сделки
+                        price_history.append(price) # Добавляем в нашу историю
+                    except (ValueError, TypeError, KeyError) as e:
+                        print(f"Ошибка получения цены из сделки: {trade}, ошибка: {e}")
+                        continue # Пропускаем эту сделку
+
+                    # Вызываем функцию проверки из модуля detectors
+                    is_brush, details = check_brush_pattern(price_history) # Передаем историю
+
+                    if is_brush:
+                        new_pattern_found_in_batch = True # Запоминаем, что паттерн найден
+                        details_for_batch = details # Сохраняем детали для вывода
+
+                # Выводим сообщение только если паттерн найден в этой пачке
+                # и прошло время "остывания"
+                current_time = time.time()
+                if new_pattern_found_in_batch and (current_time - last_pattern_print_time > cooldown_period):
+                     print("="*20 + " ПАТТЕРН 'ЁРШИК' ОБНАРУЖЕН! " + "="*20)
+                     print(f"Символ: {TEST_SYMBOL}")
+                     print(f"Детали: {details_for_batch}")
+                     # Выводим цену из последней ОБРАБОТАННОЙ сделки в пачке
+                     if price_history: # Проверка, что история не пуста
+                         print(f"Последняя цена в истории: {price_history[-1]}")
+                     print("="*68)
+                     last_pattern_print_time = current_time # Обновляем время
+
+        except ccxt.NetworkError as e:
             print(f"Ошибка сети ccxt: {e}. Попытка переподключения...")
-            await asyncio.sleep(1) # Пауза перед переподключением
-        except ccxtpro.ExchangeError as e:
+            price_history.clear()
+            await asyncio.sleep(5)
+        # ИЗМЕНЕНО: Используем ccxt.ExchangeError
+        except ccxt.ExchangeError as e:
             print(f"Ошибка биржи ccxt: {e}")
-            break # Выход при ошибке биржи (можно добавить логику переподключения)
+            # Если это BadSymbol, нет смысла переподключаться
+            if isinstance(e, ccxt.BadSymbol):
+                print(f"Неверный символ {TEST_SYMBOL}. Завершение работы.")
+                break
+            # Для других ошибок биржи можно добавить логику переподключения
+            await asyncio.sleep(5) # Пауза перед возможным продолжением или выходом
         except Exception as e:
-            print(f"Произошла общая ошибка: {e}")
-            await asyncio.sleep(1) # Пауза перед продолжением
-        # finally:
-            # Закрытие соединения ccxt обычно обрабатывает сам при выходе из цикла
-            # Но для чистоты можно добавить await exchange.close() при завершении
+            print(f"Произошла общая ошибка в цикле: {e}")
+            await asyncio.sleep(1)
 
-    # Важно закрыть соединение при выходе из цикла (если не используется try/except в основном блоке)
     await exchange.close()
     print("Соединение с MEXC закрыто.")
 
-
-# async def send_test_message():
-#     # ... (код отправки в Telegram пока не нужен)
-
 if __name__ == "__main__":
-    print("Запускаем отслеживание сделок MEXC через ccxt.pro...")
+    print("Запускаем отслеживание сделок и детектор 'Ёршика' (модульная версия)...")
     try:
         asyncio.run(watch_mexc_deals())
     except KeyboardInterrupt:
