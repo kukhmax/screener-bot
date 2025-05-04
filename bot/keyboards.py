@@ -4,7 +4,7 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🔎 Запустить сканирование")], # <-- Надпись
-            [KeyboardButton(text="📸 Получить скриншот")],
+            [KeyboardButton(text="📈 Получить график")],
         ],
         resize_keyboard=True,
         one_time_keyboard=False
