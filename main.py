@@ -58,10 +58,13 @@ async def check_exchange_timeframes(exchange):
 
 # --- Функция получения OHLCV ---
 async def fetch_ohlcv_safe(exchange: ccxt_async.Exchange, symbol: str, timeframe: str, limit: int):
+    reported_errors = set() # Локальные ошибки для одного цикла
     try:
         ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        if not ohlcv: return symbol, None
-        if all(len(candle) >= 5 for candle in ohlcv): return symbol, ohlcv
+        if not ohlcv:
+            return symbol, None
+        if all(len(candle) >= 5 for candle in ohlcv):
+            return symbol, ohlcv
         else:
              valid_ohlcv = [candle for candle in ohlcv if len(candle) >= 5]
              # Проверяем на МИНИМАЛЬНО необходимое количество свечей
@@ -81,7 +84,6 @@ async def fetch_ohlcv_safe(exchange: ccxt_async.Exchange, symbol: str, timeframe
     except ccxt.ExchangeError as e: print(f"ExchangeError для {symbol}: {e}.")
     except Exception as e: print(f"Unknown Error для {symbol}: {e}"); # traceback.print_exc()
     return symbol, None
-fetch_ohlcv_safe.reported_errors = set()
 
 # --- Функция дозаписи в CSV ---
 def append_patterns_to_csv(patterns_data: list, filename: str):
@@ -105,88 +107,79 @@ def append_patterns_to_csv(patterns_data: list, filename: str):
     except Exception as e: print(f"Непредвиденная ошибка при дозаписи в CSV {filename}: {e}"); traceback.print_exc()
 
 # --- Основная функция проверки паттернов ---
-async def periodic_pattern_check(symbols: list):
-    if not symbols: print("Нет символов для проверки."); return
+# --- ОСНОВНАЯ ФУНКЦИЯ ОДНОГО ЦИКЛА СКАНИРОВАНИЯ ---
+async def run_one_scan_cycle(symbols: list):
+    """
+    Выполняет ОДИН цикл проверки паттернов для списка символов.
+    Возвращает tuple: (list_of_brush_results, list_of_ladder_results)
+    Каждый элемент списка - словарь с данными паттерна.
+    """
+    if not symbols:
+        print("Нет символов для сканирования.")
+        return [], []
+
+    # Списки для сбора результатов этого цикла
+    brush_patterns_found = []
+    ladder_patterns_found = []
 
     exchange = ccxt_async.mexc({'options': {'defaultType': 'spot'}})
-    print("\nПроверка поддержки OHLCV и таймфреймов...")
-    if not await check_exchange_timeframes(exchange):
-        print("Завершение работы из-за проблем с поддержкой OHLCV/таймфреймов.")
-        await exchange.close(); return
-
-    print(f"\n[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] Начинаем периодическую проверку ({CHECK_INTERVAL_SECONDS} сек) для {len(symbols)} символов...")
+    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Запуск одного цикла сканирования для {len(symbols)} символов...")
     try:
-        while True:
-            start_time_cycle = time.time()
-            print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] Начинаем цикл проверки...")
-            fetch_ohlcv_safe.reported_errors.clear()
+        # --- Проверка поддержки OHLCV ---
+        # Убрана проверка таймфреймов отсюда, ее можно делать перед вызовом этой функции
+        # if not await check_exchange_timeframes(exchange): # Можно вернуть, если нужно
+        #     print("Проверка таймфреймов не пройдена.")
+        #     await exchange.close()
+        #     return [], []
 
-            tasks = [fetch_ohlcv_safe(exchange, symbol, CANDLE_TIMEFRAME, CANDLES_TO_FETCH) for symbol in symbols]
-            # Увеличим таймаут для gather, если много символов
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+        # --- Параллельный запрос OHLCV ---
+        start_time_fetch = time.time()
+        tasks = [fetch_ohlcv_safe(exchange, symbol, CANDLE_TIMEFRAME, CANDLES_TO_FETCH) for symbol in symbols]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        print(f"Запрос OHLCV завершен за {time.time() - start_time_fetch:.2f} сек.")
 
+        # --- Обработка результатов и детекция ---
+        print(f"Обработка результатов и детекция паттернов...")
+        start_time_detect = time.time()
+        detection_time_utc = datetime.now(timezone.utc) # Единое время для всех паттернов цикла
 
-            print(f"Обработка результатов для {len(results)} символов...")
-            brush_patterns_to_log = []
-            ladder_patterns_to_log = []
-            patterns_found_this_cycle = 0
-            current_check_time = time.time()
+        for result in results:
+            if isinstance(result, Exception): continue
+            symbol, ohlcv_list = result
+            if ohlcv_list is None: continue
 
-            for result in results:
-                if isinstance(result, Exception): continue
+            # Проверка Ёршика
+            try:
+                if len(ohlcv_list) >= BRUSH_LOOKBACK_CANDLES:
+                    is_brush, brush_details = check_brush_pattern(ohlcv_list)
+                    if is_brush:
+                        log_entry = {'timestamp_utc': detection_time_utc.strftime('%Y-%m-%d %H:%M:%S'), 'symbol': symbol, **brush_details}
+                        brush_patterns_found.append(log_entry)
+            except Exception as e_brush: print(f"Ошибка детектора Brush для {symbol}: {e_brush}"); # traceback.print_exc()
 
-                symbol, ohlcv_list = result
-                if ohlcv_list is None: continue
+            # Проверка Лесенки
+            try:
+                req_len_ladder = LADDER_LOOKBACK_CANDLES + 1
+                if len(ohlcv_list) >= req_len_ladder:
+                    is_ladder, ladder_details = check_ladder_pattern(ohlcv_list)
+                    if is_ladder:
+                        log_entry = {'timestamp_utc': detection_time_utc.strftime('%Y-%m-%d %H:%M:%S'), 'symbol': symbol, **ladder_details}
+                        ladder_patterns_found.append(log_entry)
+            except Exception as e_ladder: print(f"Ошибка детектора Ladder для {symbol}: {e_ladder}"); # traceback.print_exc()
 
-                detection_time_utc = datetime.now(timezone.utc)
+        print(f"Детекция завершена за {time.time() - start_time_detect:.2f} сек.")
 
-                # --- Проверка на Ёршик ---
-                try:
-                    if len(ohlcv_list) >= BRUSH_LOOKBACK_CANDLES: # Проверяем длину здесь
-                        is_brush, brush_details = check_brush_pattern(ohlcv_list)
-                        if is_brush:
-                            patterns_found_this_cycle +=1
-                            if current_check_time - last_pattern_print_times.get(symbol+"_brush", 0) > PRINT_COOLDOWN_SECONDS:
-                                print("-" * 25); print(f"🔥 ЁРШИК ОБНАРУЖЕН! [{symbol}]🔥");
-                                print(f"Детали: {brush_details}"); print(f"Время: {detection_time_utc.strftime('%Y-%m-%d %H:%M:%S')}"); print("-" * 25)
-                                last_pattern_print_times[symbol+"_brush"] = current_check_time
-                            if current_check_time - last_brush_log_times.get(symbol, 0) > LOG_COOLDOWN_SECONDS:
-                                log_entry = {'timestamp_utc': detection_time_utc.strftime('%Y-%m-%d %H:%M:%S'), 'symbol': symbol, **brush_details}
-                                brush_patterns_to_log.append(log_entry)
-                                last_brush_log_times[symbol] = current_check_time
-                except Exception as e_brush: print(f"Ошибка детектора Brush для {symbol}: {e_brush}"); traceback.print_exc()
-
-                # --- Проверка на Лесенку ---
-                try:
-                    req_len_ladder = LADDER_LOOKBACK_CANDLES + 1 # Исправлено
-                    if len(ohlcv_list) >= req_len_ladder: # Проверяем длину здесь
-                        is_ladder, ladder_details = check_ladder_pattern(ohlcv_list)
-                        if is_ladder:
-                            patterns_found_this_cycle +=1
-                            if current_check_time - last_pattern_print_times.get(symbol+"_ladder", 0) > PRINT_COOLDOWN_SECONDS:
-                                print("=" * 25); print(f"🪜 ЛЕСЕНКА ОБНАРУЖЕНА! [{symbol}]🪜");
-                                print(f"Детали: {ladder_details}"); print(f"Время: {detection_time_utc.strftime('%Y-%m-%d %H:%M:%S')}"); print("=" * 25)
-                                last_pattern_print_times[symbol+"_ladder"] = current_check_time
-                            if current_check_time - last_ladder_log_times.get(symbol, 0) > LOG_COOLDOWN_SECONDS:
-                                log_entry = {'timestamp_utc': detection_time_utc.strftime('%Y-%m-%d %H:%M:%S'), 'symbol': symbol, **ladder_details}
-                                ladder_patterns_to_log.append(log_entry)
-                                last_ladder_log_times[symbol] = current_check_time
-                except Exception as e_ladder: print(f"Ошибка детектора Ladder для {symbol}: {e_ladder}"); traceback.print_exc()
-
-            # --- Запись логов ---
-            if brush_patterns_to_log: append_patterns_to_csv(brush_patterns_to_log, BRUSH_PATTERN_LOG_CSV)
-            if ladder_patterns_to_log: append_patterns_to_csv(ladder_patterns_to_log, LADDER_PATTERN_LOG_CSV)
-
-            cycle_duration = time.time() - start_time_cycle
-            print(f"Цикл проверки завершен за {cycle_duration:.2f} сек. Найдено паттернов (всего): {patterns_found_this_cycle}. Записано в лог: Ершики={len(brush_patterns_to_log)}, Лесенки={len(ladder_patterns_to_log)}")
-            sleep_time = max(0, CHECK_INTERVAL_SECONDS - cycle_duration)
-            if sleep_time > 0: await asyncio.sleep(sleep_time)
-
+    except Exception as e_cycle:
+        print(f"Ошибка в цикле сканирования: {e_cycle}")
+        traceback.print_exc()
     finally:
-        print("\nПопытка закрыть соединение с MEXC (OHLCV)...")
+        # Гарантированное закрытие соединения
         if 'exchange' in locals() and hasattr(exchange, 'close'):
-             try: await exchange.close(); print("Соединение с MEXC (OHLCV) закрыто.")
-             except Exception as e_close: print(f"Ошибка при закрытии соединения OHLCV: {e_close}")
+             try: await exchange.close()
+             except Exception: pass # Игнорируем ошибки закрытия здесь
+        print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Цикл сканирования завершен.")
+
+    return brush_patterns_found, ladder_patterns_found
 
 # --- Блок if __name__ == "__main__": ---
 if __name__ == "__main__":
@@ -197,7 +190,7 @@ if __name__ == "__main__":
         print(f"\nПолучен список из {len(symbols_to_watch)} символов для периодической проверки.")
         if symbols_to_watch:
             print("\nЗапуск основного цикла периодической проверки...")
-            try: asyncio.run(periodic_pattern_check(symbols_to_watch))
+            try: asyncio.run(run_one_scan_cycle(symbols_to_watch))
             except KeyboardInterrupt: print("\nЗавершение работы по команде пользователя (Ctrl+C)...")
             except Exception as e: print(f"\nКритическая ошибка в основном потоке __main__: {e}"); traceback.print_exc()
         else: print("\nСписок символов для проверки пуст после фильтрации.")
